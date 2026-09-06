@@ -1,0 +1,823 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <math.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+#define CELL1 34
+#define CELL2 35
+#define CELL3 32
+#define CELL4 33
+
+#define RELAY 26
+#define BUZZER 25
+
+#define RELAY_FEEDBACK_ENABLED 0
+#define RELAY_FEEDBACK 27
+
+float cell1Voltage = 0.0;
+float cell2Voltage = 0.0;
+float cell3Voltage = 0.0;
+float cell4Voltage = 0.0;
+
+float oldCell1 = 0.0;
+float oldCell2 = 0.0;
+float oldCell3 = 0.0;
+float oldCell4 = 0.0;
+
+bool firstReading = true;
+
+float packVoltage = 0.0;
+float averageVoltage = 0.0;
+float highestVoltage = 0.0;
+float lowestVoltage = 0.0;
+float imbalance = 0.0;
+
+String strongestCell = "";
+String weakestCell = "";
+String batteryStatus = "";
+
+enum SystemMode
+{
+  NORMAL,
+  DEGRADED,
+  FAILSAFE,
+  SHUTDOWN
+};
+
+SystemMode systemMode = NORMAL;
+
+enum FaultType
+{
+  NO_FAULT,
+  CELL1_DISCONNECTED,
+  CELL2_DISCONNECTED,
+  CELL3_DISCONNECTED,
+  CELL4_DISCONNECTED,
+  INVALID_READING,
+  WEAK_CELL,
+  OVER_VOLTAGE,
+  ADC_FROZEN,
+  RELAY_MISMATCH
+};
+
+FaultType activeFault = NO_FAULT;
+
+unsigned long previousMillis = 0;
+const unsigned long monitorInterval = 1000;
+
+unsigned long screenTimer = 0;
+const unsigned long screenInterval = 3000;
+
+int currentScreen = 0;
+
+unsigned long recoveryStart = 0;
+const unsigned long recoveryTime = 5000;
+
+unsigned long failsafeStart = 0;
+const unsigned long shutdownTime = 10000;
+
+struct FaultLog
+{
+  unsigned long timestamp;
+  FaultType fault;
+  SystemMode mode;
+};
+
+const int MAX_LOGS = 10;
+
+FaultLog faultLogs[MAX_LOGS];
+
+int logIndex = 0;
+
+bool simulateFrozenADC = false;
+
+void readCells();
+void calculateBattery();
+void detectSensorFaults();
+void detectBatteryFaults();
+void detectFrozenADC();
+void detectRelayMismatch();
+void manageSystemMode();
+void controlOutputs();
+void updateLCD();
+void serialOutput();
+void checkSerialCommand();
+void logFault(FaultType fault);
+void printFaultName(FaultType fault);
+void printModeName(SystemMode mode);
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(RELAY, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+#if RELAY_FEEDBACK_ENABLED
+  pinMode(RELAY_FEEDBACK, INPUT);
+#endif
+
+  digitalWrite(RELAY, LOW);
+  digitalWrite(BUZZER, LOW);
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.print("SMART BMS");
+
+  lcd.setCursor(0, 1);
+  lcd.print("TASK 4");
+
+  Serial.println();
+  Serial.println("TASK 4");
+  Serial.println("FAULT TOLERANT BMS");
+  Serial.println();
+  Serial.println("System Mode : NORMAL");
+  Serial.println("Type F = Simulate ADC Frozen");
+  Serial.println("Type R = Clear Fault");
+  Serial.println();
+}
+
+void loop()
+{
+  unsigned long currentMillis = millis();
+
+  checkSerialCommand();
+
+  if (currentMillis - previousMillis >= monitorInterval)
+  {
+    previousMillis = currentMillis;
+
+    readCells();
+
+    calculateBattery();
+
+    detectSensorFaults();
+
+    detectBatteryFaults();
+
+    detectFrozenADC();
+
+    detectRelayMismatch();
+
+    manageSystemMode();
+
+    controlOutputs();
+
+    updateLCD();
+
+    serialOutput();
+  }
+
+  if (currentMillis - screenTimer >= screenInterval)
+  {
+    screenTimer = currentMillis;
+
+    currentScreen++;
+
+    if (currentScreen > 3)
+    {
+      currentScreen = 0;
+    }
+  }
+}
+
+void readCells()
+{
+  cell1Voltage = (analogRead(CELL1) / 4095.0) * 4.2;
+  cell2Voltage = (analogRead(CELL2) / 4095.0) * 4.2;
+  cell3Voltage = (analogRead(CELL3) / 4095.0) * 4.2;
+  cell4Voltage = (analogRead(CELL4) / 4095.0) * 4.2;
+}
+
+void calculateBattery()
+{
+  packVoltage =
+    cell1Voltage +
+    cell2Voltage +
+    cell3Voltage +
+    cell4Voltage;
+
+  averageVoltage = packVoltage / 4.0;
+
+  highestVoltage = cell1Voltage;
+  strongestCell = "CELL1";
+
+  if (cell2Voltage > highestVoltage)
+  {
+    highestVoltage = cell2Voltage;
+    strongestCell = "CELL2";
+  }
+
+  if (cell3Voltage > highestVoltage)
+  {
+    highestVoltage = cell3Voltage;
+    strongestCell = "CELL3";
+  }
+
+  if (cell4Voltage > highestVoltage)
+  {
+    highestVoltage = cell4Voltage;
+    strongestCell = "CELL4";
+  }
+
+  lowestVoltage = cell1Voltage;
+  weakestCell = "CELL1";
+
+  if (cell2Voltage < lowestVoltage)
+  {
+    lowestVoltage = cell2Voltage;
+    weakestCell = "CELL2";
+  }
+
+  if (cell3Voltage < lowestVoltage)
+  {
+    lowestVoltage = cell3Voltage;
+    weakestCell = "CELL3";
+  }
+
+  if (cell4Voltage < lowestVoltage)
+  {
+    lowestVoltage = cell4Voltage;
+    weakestCell = "CELL4";
+  }
+
+  if (averageVoltage > 0)
+  {
+    imbalance =
+      ((highestVoltage - lowestVoltage) /
+       averageVoltage) * 100.0;
+  }
+  else
+  {
+    imbalance = 0;
+  }
+
+  if (imbalance < 5)
+  {
+    batteryStatus = "HEALTHY";
+  }
+  else if (imbalance < 15)
+  {
+    batteryStatus = "MINOR IMBALANCE";
+  }
+  else if (imbalance < 30)
+  {
+    batteryStatus = "CRITICAL";
+  }
+  else
+  {
+    batteryStatus = "PACK FAILURE";
+  }
+}
+
+void detectSensorFaults()
+{
+  activeFault = NO_FAULT;
+
+  if (cell1Voltage < 0.1)
+  {
+    activeFault = CELL1_DISCONNECTED;
+    return;
+  }
+
+  if (cell1Voltage > 4.3)
+  {
+    activeFault = INVALID_READING;
+    return;
+  }
+
+  if (cell2Voltage < 0.1)
+  {
+    activeFault = CELL2_DISCONNECTED;
+    return;
+  }
+
+  if (cell2Voltage > 4.3)
+  {
+    activeFault = INVALID_READING;
+    return;
+  }
+
+  if (cell3Voltage < 0.1)
+  {
+    activeFault = CELL3_DISCONNECTED;
+    return;
+  }
+
+  if (cell3Voltage > 4.3)
+  {
+    activeFault = INVALID_READING;
+    return;
+  }
+
+  if (cell4Voltage < 0.1)
+  {
+    activeFault = CELL4_DISCONNECTED;
+    return;
+  }
+
+  if (cell4Voltage > 4.3)
+  {
+    activeFault = INVALID_READING;
+    return;
+  }
+}
+
+void detectBatteryFaults()
+{
+  if (activeFault != NO_FAULT)
+  {
+    return;
+  }
+
+  if (lowestVoltage < 3.0)
+  {
+    activeFault = WEAK_CELL;
+    return;
+  }
+
+  if (highestVoltage > 4.1)
+  {
+    activeFault = OVER_VOLTAGE;
+    return;
+  }
+}
+
+void detectFrozenADC()
+{
+  if (simulateFrozenADC)
+  {
+    activeFault = ADC_FROZEN;
+  }
+}
+
+void detectRelayMismatch()
+{
+#if RELAY_FEEDBACK_ENABLED
+
+  int feedback = digitalRead(RELAY_FEEDBACK);
+
+  if (systemMode == NORMAL ||
+      systemMode == DEGRADED)
+  {
+    if (feedback != HIGH)
+    {
+      activeFault = RELAY_MISMATCH;
+    }
+  }
+
+  if (systemMode == FAILSAFE ||
+      systemMode == SHUTDOWN)
+  {
+    if (feedback != LOW)
+    {
+      activeFault = RELAY_MISMATCH;
+    }
+  }
+
+#endif
+}
+
+void manageSystemMode()
+{
+  if (activeFault == NO_FAULT)
+  {
+    if (systemMode != NORMAL)
+    {
+      if (recoveryStart == 0)
+      {
+        recoveryStart = millis();
+      }
+
+      if (millis() - recoveryStart >= recoveryTime)
+      {
+        systemMode = NORMAL;
+        recoveryStart = 0;
+
+        Serial.println();
+        Serial.println("RECOVERY COMPLETE");
+        Serial.println("SYSTEM MODE : NORMAL");
+      }
+    }
+
+    return;
+  }
+
+  recoveryStart = 0;
+
+  if (activeFault == CELL1_DISCONNECTED ||
+      activeFault == CELL2_DISCONNECTED ||
+      activeFault == CELL3_DISCONNECTED ||
+      activeFault == CELL4_DISCONNECTED)
+  {
+    if (systemMode != DEGRADED)
+    {
+      systemMode = DEGRADED;
+      logFault(activeFault);
+    }
+
+    return;
+  }
+
+  if (activeFault == WEAK_CELL)
+  {
+    if (systemMode != DEGRADED)
+    {
+      systemMode = DEGRADED;
+      logFault(activeFault);
+    }
+
+    return;
+  }
+
+  if (activeFault == INVALID_READING)
+  {
+    if (systemMode != FAILSAFE)
+    {
+      systemMode = FAILSAFE;
+      failsafeStart = millis();
+      logFault(activeFault);
+    }
+
+    return;
+  }
+
+  if (activeFault == OVER_VOLTAGE)
+  {
+    if (systemMode != FAILSAFE)
+    {
+      systemMode = FAILSAFE;
+      failsafeStart = millis();
+      logFault(activeFault);
+    }
+
+    return;
+  }
+
+  if (activeFault == ADC_FROZEN)
+  {
+    if (systemMode != FAILSAFE)
+    {
+      systemMode = FAILSAFE;
+      failsafeStart = millis();
+      logFault(activeFault);
+    }
+
+    return;
+  }
+
+  if (activeFault == RELAY_MISMATCH)
+  {
+    if (systemMode != FAILSAFE)
+    {
+      systemMode = FAILSAFE;
+      failsafeStart = millis();
+      logFault(activeFault);
+    }
+
+    return;
+  }
+}
+
+void controlOutputs()
+{
+  if (systemMode == NORMAL)
+  {
+    digitalWrite(RELAY, HIGH);
+    digitalWrite(BUZZER, LOW);
+  }
+  else if (systemMode == DEGRADED)
+  {
+    digitalWrite(RELAY, HIGH);
+    digitalWrite(BUZZER, HIGH);
+  }
+  else if (systemMode == FAILSAFE)
+  {
+    digitalWrite(RELAY, LOW);
+    digitalWrite(BUZZER, HIGH);
+  }
+  else if (systemMode == SHUTDOWN)
+  {
+    digitalWrite(RELAY, LOW);
+    digitalWrite(BUZZER, LOW);
+  }
+}
+
+void updateLCD()
+{
+  lcd.clear();
+
+  if (systemMode == FAILSAFE)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print("FAILSAFE");
+
+    lcd.setCursor(0, 1);
+
+    if (activeFault == ADC_FROZEN)
+    {
+      lcd.print("ADC FROZEN");
+    }
+    else if (activeFault == OVER_VOLTAGE)
+    {
+      lcd.print("OVER VOLTAGE");
+    }
+    else if (activeFault == INVALID_READING)
+    {
+      lcd.print("INVALID DATA");
+    }
+    else
+    {
+      lcd.print("OUTPUT OFF");
+    }
+
+    return;
+  }
+
+  if (systemMode == SHUTDOWN)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print("SYSTEM");
+
+    lcd.setCursor(0, 1);
+    lcd.print("SHUTDOWN");
+
+    return;
+  }
+
+  if (systemMode == DEGRADED)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print("DEGRADED");
+
+    lcd.setCursor(0, 1);
+
+    if (activeFault == CELL1_DISCONNECTED)
+    {
+      lcd.print("CELL1 FAULT");
+    }
+    else if (activeFault == CELL2_DISCONNECTED)
+    {
+      lcd.print("CELL2 FAULT");
+    }
+    else if (activeFault == CELL3_DISCONNECTED)
+    {
+      lcd.print("CELL3 FAULT");
+    }
+    else if (activeFault == CELL4_DISCONNECTED)
+    {
+      lcd.print("CELL4 FAULT");
+    }
+    else if (activeFault == WEAK_CELL)
+    {
+      lcd.print("WEAK CELL");
+    }
+    else
+    {
+      lcd.print("FAULT");
+    }
+
+    return;
+  }
+
+  if (currentScreen == 0)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print("PACK:");
+    lcd.print(packVoltage, 1);
+    lcd.print("V");
+
+    lcd.setCursor(0, 1);
+    lcd.print("NORMAL");
+  }
+  else if (currentScreen == 1)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print("C1:");
+    lcd.print(cell1Voltage, 1);
+    lcd.print(" C2:");
+    lcd.print(cell2Voltage, 1);
+
+    lcd.setCursor(0, 1);
+    lcd.print("C3:");
+    lcd.print(cell3Voltage, 1);
+    lcd.print(" C4:");
+    lcd.print(cell4Voltage, 1);
+  }
+  else if (currentScreen == 2)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print("AVG:");
+    lcd.print(averageVoltage, 2);
+
+    lcd.setCursor(0, 1);
+    lcd.print("IMB:");
+    lcd.print(imbalance, 1);
+    lcd.print("%");
+  }
+  else if (currentScreen == 3)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print("BATTERY:");
+
+    lcd.setCursor(0, 1);
+    lcd.print(batteryStatus);
+  }
+}
+
+void serialOutput()
+{
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("BATTERY MONITOR");
+  Serial.println("================================");
+
+  Serial.print("Cell1 : ");
+  Serial.print(cell1Voltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Cell2 : ");
+  Serial.print(cell2Voltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Cell3 : ");
+  Serial.print(cell3Voltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Cell4 : ");
+  Serial.print(cell4Voltage, 2);
+  Serial.println(" V");
+
+  Serial.println();
+
+  Serial.print("Pack Voltage : ");
+  Serial.print(packVoltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Average : ");
+  Serial.print(averageVoltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Imbalance : ");
+  Serial.print(imbalance, 2);
+  Serial.println(" %");
+
+  Serial.println();
+
+  Serial.print("Strongest : ");
+  Serial.print(strongestCell);
+  Serial.print(" ");
+  Serial.print(highestVoltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Weakest : ");
+  Serial.print(weakestCell);
+  Serial.print(" ");
+  Serial.print(lowestVoltage, 2);
+  Serial.println(" V");
+
+  Serial.println();
+
+  Serial.print("MODE : ");
+  printModeName(systemMode);
+
+  Serial.print("FAULT : ");
+  printFaultName(activeFault);
+
+  Serial.print("TIME : ");
+  Serial.print(millis());
+  Serial.println(" ms");
+
+  Serial.println("================================");
+}
+
+void checkSerialCommand()
+{
+  if (Serial.available() > 0)
+  {
+    char command = Serial.read();
+
+    if (command == 'F' ||
+        command == 'f')
+    {
+      simulateFrozenADC = true;
+
+      Serial.println();
+      Serial.println("ADC FROZEN TEST ENABLED");
+      Serial.println();
+    }
+
+    if (command == 'R' ||
+        command == 'r')
+    {
+      simulateFrozenADC = false;
+
+      activeFault = NO_FAULT;
+
+      recoveryStart = millis();
+
+      Serial.println();
+      Serial.println("FAULT CLEARED");
+      Serial.println("RECOVERY STARTED");
+      Serial.println();
+    }
+  }
+}
+
+void logFault(FaultType fault)
+{
+  if (logIndex < MAX_LOGS)
+  {
+    faultLogs[logIndex].timestamp = millis();
+    faultLogs[logIndex].fault = fault;
+    faultLogs[logIndex].mode = systemMode;
+
+    logIndex++;
+  }
+
+  Serial.println();
+  Serial.println("******** FAULT LOG ********");
+
+  Serial.print("Timestamp : ");
+  Serial.print(millis());
+  Serial.println(" ms");
+
+  Serial.print("Fault : ");
+  printFaultName(fault);
+
+  Serial.print("Mode : ");
+  printModeName(systemMode);
+
+  Serial.println("****************************");
+}
+
+void printFaultName(FaultType fault)
+{
+  switch (fault)
+  {
+    case NO_FAULT:
+      Serial.println("NO FAULT");
+      break;
+
+    case CELL1_DISCONNECTED:
+      Serial.println("CELL1 SENSOR DISCONNECTED");
+      break;
+
+    case CELL2_DISCONNECTED:
+      Serial.println("CELL2 SENSOR DISCONNECTED");
+      break;
+
+    case CELL3_DISCONNECTED:
+      Serial.println("CELL3 SENSOR DISCONNECTED");
+      break;
+
+    case CELL4_DISCONNECTED:
+      Serial.println("CELL4 SENSOR DISCONNECTED");
+      break;
+
+    case INVALID_READING:
+      Serial.println("INVALID READING");
+      break;
+
+    case WEAK_CELL:
+      Serial.println("WEAK CELL");
+      break;
+
+    case OVER_VOLTAGE:
+      Serial.println("OVER VOLTAGE");
+      break;
+
+    case ADC_FROZEN:
+      Serial.println("ADC FROZEN");
+      break;
+
+    case RELAY_MISMATCH:
+      Serial.println("RELAY MISMATCH");
+      break;
+  }
+}
+
+void printModeName(SystemMode mode)
+{
+  switch (mode)
+  {
+    case NORMAL:
+      Serial.println("NORMAL");
+      break;
+
+    case DEGRADED:
+      Serial.println("DEGRADED");
+      break;
+
+    case FAILSAFE:
+      Serial.println("FAILSAFE");
+      break;
+
+    case SHUTDOWN:
+      Serial.println("SHUTDOWN");
+      break;
+  }
+}
