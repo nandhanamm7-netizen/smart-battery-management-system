@@ -1,6 +1,6 @@
 #define BLYNK_TEMPLATE_ID "TMPL3xTl3vGIU"
 #define BLYNK_TEMPLATE_NAME "smart BMS"
-#define BLYNK_AUTH_TOKEN "SQRTqzIH9epVnhUK5QwtskZEh1YZNod-"
+#define BLYNK_AUTH_TOKEN "YOUR_BLYNK_AUTH_TOKEN"
 
 
 #include <BlynkSimpleEsp32.h>
