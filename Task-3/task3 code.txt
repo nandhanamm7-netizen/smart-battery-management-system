@@ -1,0 +1,550 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+// LCD
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+// INPUT PINS - SIMULATED CELL VOLTAGES
+#define CELL1 34
+#define CELL2 35
+#define CELL3 32
+#define CELL  33
+// OUTPUT PINS
+#define RELAY 26
+#define BUZZER 25
+// CELL VOLTAGES
+float cell1Voltage = 0.0;
+float cell2Voltage = 0.0;
+float cell3Voltage = 0.0;
+float cell4Voltage = 0.0;
+// Previous values for fluctuation detection
+float oldCell1 = 0.0;
+float oldCell2 = 0.0;
+float oldCell3 = 0.0;
+float oldCell4 = 0.0
+bool firstReading = true;
+// BATTERY PARAMETERS
+float packVoltage = 0.0;
+float averageVoltage = 0.0;
+float highestVoltage = 0.0;
+float lowestVoltage = 0.0;
+float imbalance = 0.0;
+String strongestCell = "";
+String weakestCell = "";
+// BATTERY HEALTH
+String batteryStatus = "";
+// SYSTEM STATES
+/*
+   0 = NORMAL
+   1 = WEAK CELL
+   2 = OVER VOLTAGE
+   3 = SENSOR FAULT
+   4 = RAPID FLUCTUATION
+   5 = RECOVERY
+*/
+int stateCode = 0;
+// BATTERY MONITORING TIMER
+unsigned long previousMillis = 0;
+const unsigned long monitorInterval = 1000;
+// LCD SCREEN TIMER
+unsigned long screenTimer = 0;
+const unsigned long screenInterval = 3000;
+// Current normal screen
+int currentScreen = 0;
+// Used to detect screen change
+int previousScreen = -1;
+// RECOVERY TIMER
+unsigned long recoveryStart = 0;
+const unsigned long recoveryTime = 5000;
+// SETUP
+void setup()
+{
+  Serial.begin(115200);
+  // ADC resolution
+  analogReadResolution(12);
+  // Output pins
+  pinMode(RELAY, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+  // Normal condition
+  digitalWrite(RELAY, HIGH);
+  digitalWrite(BUZZER, LOW);
+  // LCD initialization
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("SMART BATTERY");
+  lcd.setCursor(0, 1);
+  lcd.print("HMI");
+  delay(1500);
+  lcd.clear();
+  Serial.println("================================");
+  Serial.println(" SMART BATTERY");
+  Serial.println(" INTELLIGENT HMI SYSTEM");
+  Serial.println("================================");
+}
+// MAIN LOOP
+void loop()
+{
+  unsigned long currentMillis = millis();
+  // BATTERY MONITORING
+
+  if (currentMillis - previousMillis >= monitorInterval)
+  {
+    previousMillis = currentMillis;
+    readCells();
+    calculateBattery();
+    detectFaults();
+    controlOutputs();
+    serialOutput();
+  }
+  // RECOVERY PROCESS
+  if (stateCode == 5)
+  {
+    if (millis() - recoveryStart >= recoveryTime)
+    {
+      stateCode = 0;
+      currentScreen = 0;
+      previousScreen = -1;
+      screenTimer = millis();
+      Serial.println("SYSTEM RECOVERED");
+    }
+  }
+  // LCD HMI
+  updateHMI();
+}
+// READ CELL VOLTAGES
+void readCells()
+{
+  cell1Voltage = (analogRead(CELL1) / 4095.0) * 4.2;
+  cell2Voltage = (analogRead(CELL2) / 4095.0) * 4.2;
+  cell3Voltage = (analogRead(CELL3) / 4095.0) * 4.2;
+  cell4Voltage = (analogRead(CELL4) / 4095.0) * 4.2;
+}
+// CALCULATE BATTERY PARAMETERS
+void calculateBattery()
+{  // Pack voltage
+  packVoltage =
+    cell1Voltage +
+    cell2Voltage +
+    cell3Voltage +
+    cell4Voltage;
+  // Average voltage
+  averageVoltage = packVoltage / 4.0;
+  // STRONGEST CELL
+  highestVoltage = cell1Voltage;
+  strongestCell = "CELL1";
+  if (cell2Voltage > highestVoltage)
+  {
+    highestVoltage = cell2Voltage;
+    strongestCell = "CELL2";
+  }
+  if (cell3Voltage > highestVoltage)
+  {
+    highestVoltage = cell3Voltage;
+    strongestCell = "CELL3";
+  }
+  if (cell4Voltage > highestVoltage)
+  {
+    highestVoltage = cell4Voltage;
+    strongestCell = "CELL4";
+  }
+  // WEAKEST CELL
+  lowestVoltage = cell1Voltage;
+  weakestCell = "CELL1";
+  if (cell2Voltage < lowestVoltage)
+  {
+    lowestVoltage = cell2Voltage;
+    weakestCell = "CELL2";
+  }
+  if (cell3Voltage < lowestVoltage)
+  {
+    lowestVoltage = cell3Voltage;
+    weakestCell = "CELL3";
+  }
+  if (cell4Voltage < lowestVoltage)
+  {
+    lowestVoltage = cell4Voltage;
+    weakestCell = "CELL4";
+  }
+  // IMBALANCE
+  if (averageVoltage > 0)
+  {
+    imbalance =
+      ((highestVoltage - lowestVoltage) /
+       averageVoltage) * 100.0;
+  }
+  else
+  {
+    imbalance = 0;
+  }
+  // BATTERY HEALTH
+  if (imbalance < 5)
+  {
+    batteryStatus = "HEALTHY";
+  }
+  else if (imbalance < 15)
+  {
+    batteryStatus = "MINOR IMBALANCE";
+  }
+  else if (imbalance < 30)
+  {
+    batteryStatus = "CRITICAL IMBALANCE";
+  }
+  else
+  {
+    batteryStatus = "PACK FAILURE";
+  }
+}
+// FAULT DETECTION
+void detectFaults()
+{
+  // SENSOR FAULT - HIGHEST PRIORITY
+  if (cell1Voltage < 0.1 || cell1Voltage > 4.3 ||
+      cell2Voltage < 0.1 || cell2Voltage > 4.3 ||
+      cell3Voltage < 0.1 || cell3Voltage > 4.3 ||
+      cell4Voltage < 0.1 || cell4Voltage > 4.3)
+  {
+    stateCode = 3;
+  }
+  // OVER VOLTAGE
+  else if (highestVoltage > 4.1)
+  {
+    stateCode = 2;
+  }
+  // WEAK CELL
+  else if (lowestVoltage < 3.0)
+  {
+    stateCode = 1;
+  }
+  // RAPID FLUCTUATION
+  else if (!firstReading &&
+           (abs(cell1Voltage - oldCell1) > 0.5 ||
+            abs(cell2Voltage - oldCell2) > 0.5 ||
+            abs(cell3Voltage - oldCell3) > 0.5 ||
+            abs(cell4Voltage - oldCell4) > 0.5))
+  {
+    stateCode = 4;
+  }
+  // NO FAULT
+  else
+  {
+    if (stateCode != 0 && stateCode != 5)
+    {
+      stateCode = 5;
+
+      recoveryStart = millis();
+    }
+  }
+  oldCell1 = cell1Voltage;
+  oldCell2 = cell2Voltage;
+  oldCell3 = cell3Voltage;
+  oldCell4 = cell4Voltage;
+  firstReading = false;
+}
+// CONTROL RELAY AND BUZZER
+void controlOutputs()
+{
+   // NORMAL
+  if (stateCode == 0)
+  {
+    digitalWrite(RELAY, HIGH);
+    digitalWrite(BUZZER, LOW);
+  }
+  // WEAK CELL
+  else if (stateCode == 1)
+  {
+    digitalWrite(RELAY, LOW);
+    digitalWrite(BUZZER, HIGH);
+  }
+  // OVER VOLTAGE
+  else if (stateCode == 2)
+  {
+    digitalWrite(RELAY, LOW);
+    digitalWrite(BUZZER, HIGH);
+  }
+  // SENSOR FAULT
+  else if (stateCode == 3)
+  {
+    digitalWrite(RELAY, LOW);
+    digitalWrite(BUZZER, HIGH);
+  }
+  // RAPID FLUCTUATION
+  else if (stateCode == 4)
+  {
+    digitalWrite(RELAY, LOW);
+    digitalWrite(BUZZER, HIGH);
+  }
+  // RECOVERY
+  else if (stateCode == 5)
+  {
+    digitalWrite(RELAY, LOW);
+    digitalWrite(BUZZER, LOW);
+  }
+}
+//  HMI MANAGER
+void updateHMI()
+{
+  unsigned long currentMillis = millis();
+  // FAULT PRIORITY
+  if (stateCode >= 1 && stateCode <= 4)
+  {
+    showFaultScreen();
+    return;
+  }
+  // RECOVERY PRIORITY
+  if (stateCode == 5)
+  {
+    showRecoveryScreen();
+    return;
+  }
+  // AUTOMATIC SCREEN ROTATION
+  if (currentMillis - screenTimer >= screenInterval)
+  {
+    screenTimer = currentMillis;
+    currentScreen++;
+    if (currentScreen > 5)
+    {
+      currentScreen = 0;
+    }
+    previousScreen = -1;
+  }
+  // DRAW CURRENT SCREEN
+  if (currentScreen != previousScreen)
+  {
+    lcd.clear();
+    previousScreen = currentScreen;
+  }
+
+  // DISPLAY SCREEN
+  if (currentScreen == 0)
+  {
+    screenCellVoltages();
+  }
+
+  else if (currentScreen == 1)
+  {
+    screenPackData();
+  }
+
+  else if (currentScreen == 2)
+  {
+    screenCellAnalysis();
+  }
+
+  else if (currentScreen == 3)
+  {
+    screenImbalance();
+  }
+
+  else if (currentScreen == 4)
+  {
+    screenProtection();
+  }
+
+  else if (currentScreen == 5)
+  {
+    screenDiagnostics();
+  }
+}
+// SCREEN 1 - CELL VOLTAGES
+
+void screenCellVoltages()
+{
+  lcd.setCursor(0, 0);
+  lcd.print("C1:");
+  lcd.print(cell1Voltage, 2);
+  lcd.print(" C2:");
+  lcd.print(cell2Voltage, 2);
+
+  lcd.setCursor(0, 1);
+  lcd.print("C3:");
+  lcd.print(cell3Voltage, 2);
+
+  lcd.print(" C4:");
+  lcd.print(cell4Voltage, 2);
+}
+// SCREEN 2 - PACK DATA
+
+void screenPackData()
+{
+  lcd.setCursor(0, 0);
+  lcd.print("PACK:");
+  lcd.print(packVoltage, 2);
+  lcd.print("V   ");
+  lcd.setCursor(0, 1);
+  lcd.print("AVG:");
+  lcd.print(averageVoltage, 2);
+  lcd.print("V     ");
+}
+// SCREEN 3 - CELL ANALYSIS
+void screenCellAnalysis()
+{
+  lcd.setCursor(0, 0);
+  lcd.print("HIGH:");
+  lcd.print(strongestCell);
+  lcd.print(" ");
+  lcd.setCursor(0, 1);
+  lcd.print("LOW:");
+  lcd.print(weakestCell);
+  lcd.print(" ");
+}
+// SCREEN 4 - IMBALANCE
+void screenImbalance()
+{
+  lcd.setCursor(0, 0);
+  lcd.print("IMBAL:");
+  lcd.print(imbalance, 2);
+  lcd.print("%   ");
+  lcd.setCursor(0, 1);
+  if (batteryStatus == "HEALTHY")
+  {
+    lcd.print("STATUS:HEALTHY ");
+  }
+  else if (batteryStatus == "MINOR IMBALANCE")
+  {
+    lcd.print("MINOR IMBALANCE");
+  }
+  else if (batteryStatus == "CRITICAL IMBALANCE")
+  {
+    lcd.print("CRITICAL IMBAL");
+  }
+  else
+  {
+    lcd.print("PACK FAILURE  ");
+  }
+}
+// SCREEN 5 - PROTECTION STATUS
+void screenProtection()
+{
+  lcd.setCursor(0, 0);
+  lcd.print("PROTECTION     ");
+  lcd.setCursor(0, 1);
+  if (digitalRead(RELAY) == HIGH)
+  {
+    lcd.print("RELAY:ON       ");
+  }
+  else
+  {
+    lcd.print("RELAY:OFF      ");
+  }
+}
+// SCREEN 6 - DIAGNOSTICS
+void screenDiagnostics()
+{
+  lcd.setCursor(0, 0);
+  lcd.print("DIAGNOSTIC     ");
+  lcd.setCursor(0, 1);
+  lcd.print("NO FAULT       ");
+}
+// FAULT SCREEN
+void showFaultScreen()
+{
+  // Clear only when entering fault screen
+  if (previousScreen != 100)
+  {
+    lcd.clear();
+    previousScreen = 100;
+  }
+  lcd.setCursor(0, 0);
+  lcd.print("! WARNING !    ");
+  lcd.setCursor(0, 1);
+  if (stateCode == 1)
+  {
+    lcd.print("WEAK CELL      ");
+  }
+  else if (stateCode == 2)
+  {
+    lcd.print("OVER VOLTAGE   ");
+  }
+  else if (stateCode == 3)
+  {
+    lcd.print("SENSOR FAULT   ");
+  }
+  else if (stateCode == 4)
+  {
+    lcd.print("FLUCTUATION    ");
+  }
+}
+// RECOVERY SCREEN
+void showRecoveryScreen()
+{
+  if (previousScreen != 101)
+  {
+    lcd.clear();
+    previousScreen = 101;
+  }
+
+  lcd.setCursor(0, 0);
+  lcd.print("RECOVERY       ");
+
+  lcd.setCursor(0, 1);
+  lcd.print("WAIT 5 SEC     ");
+}
+// SERIAL MONITOR
+void serialOutput()
+{
+  Serial.println();
+  Serial.println("==============================");
+  Serial.print("Cell1 Voltage : ");
+  Serial.print(cell1Voltage, 2);
+  Serial.println(" V");
+  Serial.print("Cell2 Voltage : ");
+  Serial.print(cell2Voltage, 2);
+  Serial.println(" V");
+  Serial.print("Cell3 Voltage : ");
+  Serial.print(cell3Voltage, 2);
+  Serial.println(" V");
+  Serial.print("Cell4 Voltage : ");
+  Serial.print(cell4Voltage, 2);
+  Serial.println(" V");
+  Serial.println();
+  Serial.print("Pack Voltage : ");
+  Serial.print(packVoltage, 2);
+  Serial.println(" V");
+  Serial.print("Average Voltage : ");
+  Serial.print(averageVoltage, 2);
+  Serial.println(" V");
+  Serial.println();
+  Serial.print("Strongest Cell : ");
+  Serial.print(strongestCell);
+  Serial.print(" (");
+  Serial.print(highestVoltage, 2);
+  Serial.println(" V)");
+  Serial.print("Weakest Cell : ");
+  Serial.print(weakestCell);
+  Serial.print(" (");
+  Serial.print(lowestVoltage, 2);
+  Serial.println(" V)");
+  Serial.println();
+  Serial.print("Imbalance : ");
+  Serial.print(imbalance, 2);
+  Serial.println(" %");
+  Serial.print("Battery Health : ");
+  Serial.println(batteryStatus);
+  Serial.println();
+  if (stateCode == 0)
+  {
+    Serial.println("STATUS : NORMAL");
+  }
+  else if (stateCode == 1)
+  {
+    Serial.println("STATUS : WEAK CELL");
+  }
+  else if (stateCode == 2)
+  {
+    Serial.println("STATUS : OVER VOLTAGE");
+  else if (stateCode == 3)
+  {
+    Serial.println("STATUS : SENSOR FAULT");
+  }
+  else if (stateCode == 4)
+  {
+    Serial.println("STATUS : RAPID FLUCTUATION");
+  }
+  else if (stateCode == 5)
+  {
+    Serial.println("STATUS : RECOVERY");
+  }
+  Serial.print("State Code : ");
+  Serial.println(stateCode);
+
+  Serial.println("==============================");
+}
