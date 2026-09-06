@@ -1,0 +1,720 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+//                    LCD
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+//                 INPUT PINS
+
+#define CELL1 34
+#define CELL2 35
+#define CELL3 32
+#define CELL4 33
+
+//                OUTPUT PINS
+
+#define RELAY 26
+#define BUZZER 25
+
+//              CELL VOLTAGES
+
+float cell1Voltage = 0.0;
+float cell2Voltage = 0.0;
+float cell3Voltage = 0.0;
+float cell4Voltage = 0.0;
+
+// Previous readings for fluctuation detection
+float oldCell1 = 0.0;
+float oldCell2 = 0.0;
+float oldCell3 = 0.0;
+float oldCell4 = 0.0;
+
+//              BATTERY PARAMETERS
+
+float packVoltage = 0.0;
+float averageVoltage = 0.0;
+
+float highestVoltage = 0.0;
+float lowestVoltage = 0.0;
+
+float imbalance = 0.0;
+
+String strongestCell = "";
+String weakestCell = "";
+
+//                 STATE DEFINITIONS
+
+#define NORMAL              0
+#define WEAK_CELL           1
+#define OVER_VOLTAGE        2
+#define SENSOR_FAULT        3
+#define RAPID_FLUCTUATION   4
+#define RECOVERY            5
+
+int stateCode = NORMAL;
+
+//                 VOLTAGE LIMITS
+
+// Weak-cell protection
+const float WEAK_CELL_LIMIT = 3.0;
+
+// Weak-cell recovery threshold
+// Hysteresis prevents relay chatter
+const float WEAK_CELL_RECOVERY = 3.2;
+
+// Over-voltage protection
+const float OVER_VOLTAGE_LIMIT = 4.10;
+
+// Over-voltage recovery threshold
+const float OVER_VOLTAGE_RECOVERY = 4.00;
+
+// Sensor validity limits
+const float SENSOR_MIN = 0.10;
+const float SENSOR_MAX = 4.30;
+
+// Rapid voltage fluctuation threshold
+const float FLUCTUATION_LIMIT = 0.50;
+
+//                    TIMERS
+
+// Main monitoring interval
+unsigned long previousMillis = 0;
+const unsigned long monitorInterval = 1000;
+
+// Recovery timer
+unsigned long recoveryStart = 0;
+const unsigned long recoveryTime = 5000;
+
+// Relay protection timer
+unsigned long relayChangeTime = 0;
+
+// Minimum time between relay changes
+const unsigned long relayProtectionTime = 2000;
+
+//             FIRST READING CONTROL
+
+bool firstReading = true;
+
+//              RELAY STATE CONTROL
+
+bool relayState = true;
+
+//                     SETUP
+
+void setup()
+{
+    Serial.begin(115200);
+
+    // Output pins
+    pinMode(RELAY, OUTPUT);
+    pinMode(BUZZER, OUTPUT);
+
+    // Initial safe condition
+    digitalWrite(RELAY, HIGH);
+    digitalWrite(BUZZER, LOW);
+
+    relayState = true;
+
+    // LCD initialization
+    lcd.init();
+    lcd.backlight();
+
+    lcd.setCursor(0, 0);
+    lcd.print("SMART BMS");
+
+    lcd.setCursor(0, 1);
+    lcd.print("TASK 2 START");
+
+    delay(1000);
+
+    lcd.clear();
+
+    Serial.println();
+    Serial.println("====================================");
+    Serial.println(" EVENT-DRIVEN SAFETY PROTECTION");
+    Serial.println("====================================");
+}
+
+//                      LOOP
+
+void loop()
+{
+    unsigned long currentMillis = millis();
+
+    // Non-blocking monitoring timer
+    
+
+    if (currentMillis - previousMillis >= monitorInterval)
+    {
+        previousMillis = currentMillis;
+
+        // 1. Read sensors
+        readCells();
+
+        // 2. Calculate battery parameters
+        calculateBattery();
+
+        // 3. Detect battery events/faults
+        detectFaults();
+
+        // 4. Control relay and buzzer
+        controlOutputs();
+
+        // 5. Update LCD
+        updateLCD();
+
+        // 6. Display Serial information
+        serialOutput();
+    }
+
+    
+    // Recovery timer
+
+    handleRecovery();
+}
+
+//                 READ CELL VOLTAGES
+
+void readCells()
+{
+    /*
+       ADC conversion:
+
+       ADC range = 0 to 4095
+       Assumed maximum measured voltage = 4.2 V
+
+       NOTE:
+       This formula must match the actual voltage
+       divider / sensing circuit used in hardware.
+    */
+
+    cell1Voltage = (analogRead(CELL1) / 4095.0) * 4.2;
+
+    cell2Voltage = (analogRead(CELL2) / 4095.0) * 4.2;
+
+    cell3Voltage = (analogRead(CELL3) / 4095.0) * 4.2;
+
+    cell4Voltage = (analogRead(CELL4) / 4095.0) * 4.2;
+}
+
+//             CALCULATE BATTERY PARAMETERS
+
+void calculateBattery()
+{
+
+    // Pack voltage
+    
+    packVoltage =
+        cell1Voltage +
+        cell2Voltage +
+        cell3Voltage +
+        cell4Voltage;
+
+    
+    // Average cell voltage
+
+    averageVoltage = packVoltage / 4.0;
+
+    // Find strongest cell
+
+    highestVoltage = cell1Voltage;
+    strongestCell = "CELL1";
+
+    if (cell2Voltage > highestVoltage)
+    {
+        highestVoltage = cell2Voltage;
+        strongestCell = "CELL2";
+    }
+
+    if (cell3Voltage > highestVoltage)
+    {
+        highestVoltage = cell3Voltage;
+        strongestCell = "CELL3";
+    }
+
+    if (cell4Voltage > highestVoltage)
+    {
+        highestVoltage = cell4Voltage;
+        strongestCell = "CELL4";
+    }
+
+    
+    // Find weakest cell
+
+    lowestVoltage = cell1Voltage;
+    weakestCell = "CELL1";
+
+    if (cell2Voltage < lowestVoltage)
+    {
+        lowestVoltage = cell2Voltage;
+        weakestCell = "CELL2";
+    }
+
+    if (cell3Voltage < lowestVoltage)
+    {
+        lowestVoltage = cell3Voltage;
+        weakestCell = "CELL3";
+    }
+
+    if (cell4Voltage < lowestVoltage)
+    {
+        lowestVoltage = cell4Voltage;
+        weakestCell = "CELL4";
+    }
+
+    // Calculate imbalance
+
+    if (averageVoltage > 0)
+    {
+        imbalance =
+            ((highestVoltage - lowestVoltage) /
+             averageVoltage) * 100.0;
+    }
+    else
+    {
+        imbalance = 0;
+    }
+}
+
+//                  SENSOR VALIDATION
+
+bool sensorFaultDetected()
+{
+    if (cell1Voltage < SENSOR_MIN ||
+        cell1Voltage > SENSOR_MAX)
+    {
+        return true;
+    }
+
+    if (cell2Voltage < SENSOR_MIN ||
+        cell2Voltage > SENSOR_MAX)
+    {
+        return true;
+    }
+
+    if (cell3Voltage < SENSOR_MIN ||
+        cell3Voltage > SENSOR_MAX)
+    {
+        return true;
+    }
+
+    if (cell4Voltage < SENSOR_MIN ||
+        cell4Voltage > SENSOR_MAX)
+    {
+        return true;
+    }
+
+    return false;
+}
+
+//              RAPID FLUCTUATION DETECTION
+
+bool rapidFluctuationDetected()
+{
+    /*
+       Ignore fluctuation detection during the
+       first reading because there is no previous
+       valid measurement yet.
+    */
+
+    if (firstReading)
+    {
+        return false;
+    }
+
+    if (fabs(cell1Voltage - oldCell1) > FLUCTUATION_LIMIT)
+    {
+        return true;
+    }
+
+    if (fabs(cell2Voltage - oldCell2) > FLUCTUATION_LIMIT)
+    {
+        return true;
+    }
+
+    if (fabs(cell3Voltage - oldCell3) > FLUCTUATION_LIMIT)
+    {
+        return true;
+    }
+
+    if (fabs(cell4Voltage - oldCell4) > FLUCTUATION_LIMIT)
+    {
+        return true;
+    }
+
+    return false;
+}
+
+//                    FAULT DETECTION
+
+void detectFaults()
+{
+    
+    // PRIORITY 1: SENSOR FAULT
+
+    if (sensorFaultDetected())
+    {
+        stateCode = SENSOR_FAULT;
+
+        return;
+    }
+
+    // PRIORITY 2: OVER VOLTAGE
+
+    if (highestVoltage > OVER_VOLTAGE_LIMIT)
+    {
+        stateCode = OVER_VOLTAGE;
+
+        return;
+    }
+
+    // PRIORITY 3: WEAK CELL
+
+    if (lowestVoltage < WEAK_CELL_LIMIT)
+    {
+        stateCode = WEAK_CELL;
+
+        return;
+    }
+
+    // PRIORITY 4: RAPID FLUCTUATION
+
+    if (rapidFluctuationDetected())
+    {
+        stateCode = RAPID_FLUCTUATION;
+
+        return;
+    }
+
+    // NORMAL CONDITION
+
+    /*
+       If a fault has disappeared, do not immediately
+       turn the relay ON.
+
+       First enter RECOVERY state.
+    */
+
+    if (stateCode != NORMAL &&
+        stateCode != RECOVERY)
+    {
+        stateCode = RECOVERY;
+
+        recoveryStart = millis();
+    }
+
+    // Save current readings
+    oldCell1 = cell1Voltage;
+    oldCell2 = cell2Voltage;
+    oldCell3 = cell3Voltage;
+    oldCell4 = cell4Voltage;
+
+    firstReading = false;
+}
+
+//                  RECOVERY HANDLER
+
+void handleRecovery()
+{
+    if (stateCode != RECOVERY)
+    {
+        return;
+    }
+
+    unsigned long currentMillis = millis();
+
+    // Check if recovery conditions are still safe
+
+    if (sensorFaultDetected())
+    {
+        stateCode = SENSOR_FAULT;
+        return;
+    }
+
+    if (highestVoltage > OVER_VOLTAGE_RECOVERY)
+    {
+        stateCode = OVER_VOLTAGE;
+        return;
+    }
+
+    if (lowestVoltage < WEAK_CELL_RECOVERY)
+    {
+        stateCode = WEAK_CELL;
+        return;
+    }
+
+    // Wait for stable recovery period
+
+    if (currentMillis - recoveryStart >= recoveryTime)
+    {
+        stateCode = NORMAL;
+    }
+}
+
+//              RELAY CONTROL FUNCTION
+
+void setRelay(bool newState)
+{
+    unsigned long currentMillis = millis();
+
+    /*
+       Anti-relay-chatter protection.
+
+       The relay cannot change state repeatedly
+       within the protection interval.
+    */
+
+    if (newState != relayState)
+    {
+        if (currentMillis - relayChangeTime >=
+            relayProtectionTime)
+        {
+            relayState = newState;
+
+            digitalWrite(RELAY,
+                         relayState ? HIGH : LOW);
+
+            relayChangeTime = currentMillis;
+        }
+    }
+}
+
+//                 OUTPUT CONTROL
+
+void controlOutputs()
+{
+    // NORMAL
+
+    if (stateCode == NORMAL)
+    {
+        setRelay(true);
+
+        digitalWrite(BUZZER, LOW);
+    }
+
+    // WEAK CELL
+
+    else if (stateCode == WEAK_CELL)
+    {
+        setRelay(false);
+
+        digitalWrite(BUZZER, HIGH);
+    }
+
+    // OVER VOLTAGE
+
+    else if (stateCode == OVER_VOLTAGE)
+    {
+        setRelay(false);
+
+        digitalWrite(BUZZER, HIGH);
+    }
+
+    // SENSOR FAULT
+
+    else if (stateCode == SENSOR_FAULT)
+    {
+        setRelay(false);
+
+        digitalWrite(BUZZER, HIGH);
+    }
+
+    // RAPID FLUCTUATION
+
+    else if (stateCode == RAPID_FLUCTUATION)
+    {
+        setRelay(false);
+
+        digitalWrite(BUZZER, HIGH);
+    }
+
+    // RECOVERY
+
+    else if (stateCode == RECOVERY)
+    {
+        setRelay(false);
+
+        digitalWrite(BUZZER, LOW);
+    }
+}
+
+//                     LCD UPDATE
+
+void updateLCD()
+{
+    lcd.clear();
+
+    // NORMAL
+
+    if (stateCode == NORMAL)
+    {
+        lcd.setCursor(0, 0);
+        lcd.print("PACK:");
+        lcd.print(packVoltage, 1);
+        lcd.print("V");
+
+        lcd.setCursor(0, 1);
+        lcd.print("NORMAL");
+    }
+
+    // WEAK CELL
+
+    else if (stateCode == WEAK_CELL)
+    {
+        lcd.setCursor(0, 0);
+        lcd.print("PACK:");
+        lcd.print(packVoltage, 1);
+        lcd.print("V");
+
+        lcd.setCursor(0, 1);
+        lcd.print("WEAK CELL");
+    }
+
+    // OVER VOLTAGE
+
+    else if (stateCode == OVER_VOLTAGE)
+    {
+        lcd.setCursor(0, 0);
+        lcd.print("PACK:");
+        lcd.print(packVoltage, 1);
+        lcd.print("V");
+
+        lcd.setCursor(0, 1);
+        lcd.print("OVER VOLTAGE");
+    }
+
+    // SENSOR FAULT
+
+    else if (stateCode == SENSOR_FAULT)
+    {
+        lcd.setCursor(0, 0);
+        lcd.print("PACK: ERROR");
+
+        lcd.setCursor(0, 1);
+        lcd.print("SENSOR FAULT");
+    }
+
+    // RAPID FLUCTUATION
+    else if (stateCode == RAPID_FLUCTUATION)
+    {
+        lcd.setCursor(0, 0);
+        lcd.print("PACK:");
+        lcd.print(packVoltage, 1);
+        lcd.print("V");
+
+        lcd.setCursor(0, 1);
+        lcd.print("FLUCTUATION");
+    }
+
+    // RECOVERY
+
+    else if (stateCode == RECOVERY)
+    {
+        lcd.setCursor(0, 0);
+        lcd.print("RECOVERY");
+
+        lcd.setCursor(0, 1);
+        lcd.print("WAIT 5 SEC");
+    }
+}
+
+//                  SERIAL OUTPUT
+
+void serialOutput()
+{
+    Serial.println();
+    Serial.println("====================================");
+
+    Serial.print("Cell1 Voltage : ");
+    Serial.print(cell1Voltage, 2);
+    Serial.println(" V");
+
+    Serial.print("Cell2 Voltage : ");
+    Serial.print(cell2Voltage, 2);
+    Serial.println(" V");
+
+    Serial.print("Cell3 Voltage : ");
+    Serial.print(cell3Voltage, 2);
+    Serial.println(" V");
+
+    Serial.print("Cell4 Voltage : ");
+    Serial.print(cell4Voltage, 2);
+    Serial.println(" V");
+
+    Serial.println();
+
+    Serial.print("Pack Voltage : ");
+    Serial.print(packVoltage, 2);
+    Serial.println(" V");
+
+    Serial.print("Average Voltage : ");
+    Serial.print(averageVoltage, 2);
+    Serial.println(" V");
+
+    Serial.println();
+
+    Serial.print("Strongest Cell : ");
+    Serial.print(strongestCell);
+    Serial.print(" (");
+    Serial.print(highestVoltage, 2);
+    Serial.println(" V)");
+
+    Serial.print("Weakest Cell : ");
+    Serial.print(weakestCell);
+    Serial.print(" (");
+    Serial.print(lowestVoltage, 2);
+    Serial.println(" V)");
+
+    Serial.println();
+
+    Serial.print("Imbalance : ");
+    Serial.print(imbalance, 2);
+    Serial.println(" %");
+
+    Serial.println();
+
+    // State message
+
+    if (stateCode == NORMAL)
+    {
+        Serial.println("STATUS : NORMAL");
+    }
+    else if (stateCode == WEAK_CELL)
+    {
+        Serial.println("STATUS : WEAK CELL");
+    }
+    else if (stateCode == OVER_VOLTAGE)
+    {
+        Serial.println("STATUS : OVER VOLTAGE");
+    }
+    else if (stateCode == SENSOR_FAULT)
+    {
+        Serial.println("STATUS : SENSOR FAULT");
+    }
+    else if (stateCode == RAPID_FLUCTUATION)
+    {
+        Serial.println("STATUS : RAPID FLUCTUATION");
+    }
+    else if (stateCode == RECOVERY)
+    {
+        Serial.println("STATUS : RECOVERY");
+    }
+
+    Serial.print("State Code : ");
+    Serial.println(stateCode);
+
+    Serial.print("Relay : ");
+    if (relayState)
+    {
+        Serial.println("ON");
+    }
+    else
+    {
+        Serial.println("OFF");
+    }
+
+    Serial.println("====================================");
+}
+
+
