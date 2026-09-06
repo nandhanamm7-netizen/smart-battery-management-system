@@ -1,0 +1,1163 @@
+#define BLYNK_TEMPLATE_ID "TMPL3xTl3vGIU"
+#define BLYNK_TEMPLATE_NAME "smart BMS"
+#define BLYNK_AUTH_TOKEN "SQRTqzIH9epVnhUK5QwtskZEh1YZNod-"
+
+#include <BlynkSimpleEsp32.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <math.h>
+
+const char* ssid = "Wokwi-GUEST";
+const char* password = "";
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+#define CELL1 34
+#define CELL2 35
+#define CELL3 32
+#define CELL4 33
+
+#define RELAY 26
+#define BUZZER 25
+
+#define RELAY_FEEDBACK_ENABLED 0
+#define RELAY_FEEDBACK 27
+
+float cell1Voltage = 0.0;
+float cell2Voltage = 0.0;
+float cell3Voltage = 0.0;
+float cell4Voltage = 0.0;
+
+float packVoltage = 0.0;
+float averageVoltage = 0.0;
+float highestVoltage = 0.0;
+float lowestVoltage = 0.0;
+float imbalance = 0.0;
+
+String strongestCell = "";
+String weakestCell = "";
+String batteryStatus = "";
+
+enum SystemMode
+{
+  NORMAL,
+  DEGRADED,
+  FAILSAFE,
+  SHUTDOWN
+};
+
+SystemMode systemMode = NORMAL;
+
+enum FaultType
+{
+  NO_FAULT,
+  CELL1_DISCONNECTED,
+  CELL2_DISCONNECTED,
+  CELL3_DISCONNECTED,
+  CELL4_DISCONNECTED,
+  INVALID_READING,
+  WEAK_CELL,
+  OVER_VOLTAGE,
+  ADC_FROZEN,
+  RELAY_MISMATCH
+};
+
+FaultType activeFault = NO_FAULT;
+
+unsigned long previousMillis = 0;
+const unsigned long monitorInterval = 1000;
+
+unsigned long screenTimer = 0;
+const unsigned long screenInterval = 3000;
+
+int currentScreen = 0;
+
+unsigned long recoveryStart = 0;
+const unsigned long recoveryTime = 5000;
+
+unsigned long failsafeStart = 0;
+const unsigned long shutdownTime = 10000;
+
+struct FaultLog
+{
+  unsigned long timestamp;
+  FaultType fault;
+  SystemMode mode;
+};
+
+const int MAX_LOGS = 10;
+
+FaultLog faultLogs[MAX_LOGS];
+
+int logIndex = 0;
+
+bool simulateFrozenADC = false;
+
+bool lastWiFiConnected = false;
+bool lastBlynkConnected = false;
+
+SystemMode oldSystemMode = NORMAL;
+FaultType oldFault = NO_FAULT;
+float oldPackVoltage = 0.0;
+
+const float VOLTAGE_CHANGE_THRESHOLD = 0.05;
+
+unsigned long wifiReconnectTimer = 0;
+const unsigned long wifiReconnectInterval = 5000;
+
+unsigned long blynkReconnectTimer = 0;
+const unsigned long blynkReconnectInterval = 5000;
+
+#define EVENT_QUEUE_SIZE 10
+
+enum TelemetryEvent
+{
+  EVENT_STATE_CHANGE,
+  EVENT_FAULT,
+  EVENT_VOLTAGE,
+  EVENT_RECONNECT
+};
+
+TelemetryEvent eventQueue[EVENT_QUEUE_SIZE];
+
+int eventHead = 0;
+int eventTail = 0;
+
+void readCells();
+void calculateBattery();
+void detectSensorFaults();
+void detectBatteryFaults();
+void detectFrozenADC();
+void detectRelayMismatch();
+void manageSystemMode();
+void controlOutputs();
+void updateLCD();
+void serialOutput();
+void checkSerialCommand();
+void logFault(FaultType fault);
+void printFaultName(FaultType fault);
+void printModeName(SystemMode mode);
+void handleConnections();
+void addTelemetryEvent(TelemetryEvent event);
+bool getTelemetryEvent(TelemetryEvent *event);
+void detectTelemetryEvents();
+void processTelemetryQueue();
+void sendTelemetry();
+
+void setup()
+{
+  Serial.begin(115200);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  pinMode(RELAY, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+#if RELAY_FEEDBACK_ENABLED
+  pinMode(RELAY_FEEDBACK, INPUT);
+#endif
+
+  digitalWrite(RELAY, LOW);
+  digitalWrite(BUZZER, LOW);
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.print("SMART BMS");
+
+  lcd.setCursor(0, 1);
+  lcd.print("TASK 5");
+
+  Serial.println();
+  Serial.println("SMART BMS TASK 5");
+  Serial.println("FAULT TOLERANT BMS");
+  Serial.println();
+  Serial.println("Cloud Telemetry : EVENT BASED");
+  Serial.println("WiFi Reconnect  : ENABLED");
+  Serial.println("Event Queue     : ENABLED");
+  Serial.println("Blynk V0-V9     : ENABLED");
+  Serial.println("Shutdown Timer  : 10 seconds");
+  Serial.println();
+  Serial.println("F = Simulate ADC Frozen");
+  Serial.println("R = Clear Fault");
+  Serial.println();
+
+  addTelemetryEvent(EVENT_STATE_CHANGE);
+}
+
+void loop()
+{
+  unsigned long currentMillis = millis();
+
+  handleConnections();
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    if (Blynk.connected())
+    {
+      Blynk.run();
+    }
+  }
+
+  checkSerialCommand();
+
+  if (currentMillis - previousMillis >= monitorInterval)
+  {
+    previousMillis = currentMillis;
+
+    readCells();
+    calculateBattery();
+    detectSensorFaults();
+    detectBatteryFaults();
+    detectFrozenADC();
+    detectRelayMismatch();
+    manageSystemMode();
+    controlOutputs();
+    detectTelemetryEvents();
+    updateLCD();
+    serialOutput();
+  }
+
+  processTelemetryQueue();
+
+  if (currentMillis - screenTimer >= screenInterval)
+  {
+    screenTimer = currentMillis;
+
+    currentScreen++;
+
+    if (currentScreen > 3)
+    {
+      currentScreen = 0;
+    }
+  }
+}
+
+void handleConnections()
+{
+  unsigned long currentMillis = millis();
+
+  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+
+  if (!wifiConnected)
+  {
+    if (currentMillis - wifiReconnectTimer >= wifiReconnectInterval)
+    {
+      wifiReconnectTimer = currentMillis;
+
+      Serial.println();
+      Serial.println("WiFi disconnected");
+      Serial.println("Trying WiFi reconnect...");
+
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+    }
+
+    lastWiFiConnected = false;
+    lastBlynkConnected = false;
+
+    return;
+  }
+
+  if (!lastWiFiConnected)
+  {
+    Serial.println();
+    Serial.println("WiFi connection restored");
+
+    addTelemetryEvent(EVENT_RECONNECT);
+
+    oldPackVoltage = -999.0;
+  }
+
+  if (!Blynk.connected())
+  {
+    if (currentMillis - blynkReconnectTimer >= blynkReconnectInterval)
+    {
+      blynkReconnectTimer = currentMillis;
+
+      Serial.println();
+      Serial.println("Blynk disconnected");
+      Serial.println("Trying Blynk reconnect...");
+
+      Blynk.connect(1000);
+    }
+
+    lastBlynkConnected = false;
+    lastWiFiConnected = true;
+
+    return;
+  }
+
+  if (!lastBlynkConnected)
+  {
+    Serial.println();
+    Serial.println("Blynk connection restored");
+
+    addTelemetryEvent(EVENT_RECONNECT);
+
+    oldSystemMode = (SystemMode)(-1);
+    oldFault = (FaultType)(-1);
+    oldPackVoltage = -999.0;
+  }
+
+  lastWiFiConnected = true;
+  lastBlynkConnected = true;
+}
+
+void addTelemetryEvent(TelemetryEvent event)
+{
+  int nextTail = (eventTail + 1) % EVENT_QUEUE_SIZE;
+
+  if (nextTail == eventHead)
+  {
+    Serial.println("Telemetry queue full");
+    return;
+  }
+
+  eventQueue[eventTail] = event;
+  eventTail = nextTail;
+
+  Serial.print("Telemetry event queued: ");
+
+  if (event == EVENT_STATE_CHANGE)
+  {
+    Serial.println("STATE CHANGE");
+  }
+  else if (event == EVENT_FAULT)
+  {
+    Serial.println("FAULT");
+  }
+  else if (event == EVENT_VOLTAGE)
+  {
+    Serial.println("VOLTAGE");
+  }
+  else if (event == EVENT_RECONNECT)
+  {
+    Serial.println("RECONNECT");
+  }
+}
+
+bool getTelemetryEvent(TelemetryEvent *event)
+{
+  if (eventHead == eventTail)
+  {
+    return false;
+  }
+
+  *event = eventQueue[eventHead];
+
+  eventHead++;
+
+  if (eventHead >= EVENT_QUEUE_SIZE)
+  {
+    eventHead = 0;
+  }
+
+  return true;
+}
+
+void detectTelemetryEvents()
+{
+  bool stateChanged = false;
+  bool faultChanged = false;
+  bool voltageChanged = false;
+
+  if (systemMode != oldSystemMode)
+  {
+    stateChanged = true;
+  }
+
+  if (activeFault != oldFault)
+  {
+    faultChanged = true;
+  }
+
+  if (fabs(packVoltage - oldPackVoltage) >= VOLTAGE_CHANGE_THRESHOLD)
+  {
+    voltageChanged = true;
+  }
+
+  if (stateChanged)
+  {
+    addTelemetryEvent(EVENT_STATE_CHANGE);
+    oldSystemMode = systemMode;
+  }
+
+  if (faultChanged)
+  {
+    addTelemetryEvent(EVENT_FAULT);
+    oldFault = activeFault;
+  }
+
+  if (voltageChanged)
+  {
+    addTelemetryEvent(EVENT_VOLTAGE);
+    oldPackVoltage = packVoltage;
+  }
+}
+
+void processTelemetryQueue()
+{
+  TelemetryEvent event;
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    return;
+  }
+
+  if (!Blynk.connected())
+  {
+    return;
+  }
+
+  if (!getTelemetryEvent(&event))
+  {
+    return;
+  }
+
+  sendTelemetry();
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("BLYNK TELEMETRY SENT");
+  Serial.println("================================");
+
+  Serial.print("Event : ");
+
+  if (event == EVENT_STATE_CHANGE)
+  {
+    Serial.println("STATE CHANGE");
+  }
+  else if (event == EVENT_FAULT)
+  {
+    Serial.println("FAULT");
+  }
+  else if (event == EVENT_VOLTAGE)
+  {
+    Serial.println("VOLTAGE CHANGE");
+  }
+  else if (event == EVENT_RECONNECT)
+  {
+    Serial.println("RECONNECT");
+  }
+
+  Serial.println();
+
+  Serial.print("Pack Voltage : ");
+  Serial.print(packVoltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Average      : ");
+  Serial.print(averageVoltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Cell1        : ");
+  Serial.print(cell1Voltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Cell2        : ");
+  Serial.print(cell2Voltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Cell3        : ");
+  Serial.print(cell3Voltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Cell4        : ");
+  Serial.print(cell4Voltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Imbalance    : ");
+  Serial.print(imbalance, 2);
+  Serial.println(" %");
+
+  Serial.print("Mode         : ");
+  printModeName(systemMode);
+
+  Serial.print("Fault        : ");
+  printFaultName(activeFault);
+
+  Serial.print("WiFi RSSI    : ");
+  Serial.print(WiFi.RSSI());
+  Serial.println(" dBm");
+
+  Serial.println("================================");
+}
+
+void sendTelemetry()
+{
+  Blynk.virtualWrite(V0, packVoltage);
+  Blynk.virtualWrite(V1, averageVoltage);
+  Blynk.virtualWrite(V2, cell1Voltage);
+  Blynk.virtualWrite(V3, cell2Voltage);
+  Blynk.virtualWrite(V4, cell3Voltage);
+  Blynk.virtualWrite(V5, cell4Voltage);
+  Blynk.virtualWrite(V6, imbalance);
+  Blynk.virtualWrite(V7, (int)systemMode);
+  Blynk.virtualWrite(V8, (int)activeFault);
+  Blynk.virtualWrite(V9, WiFi.RSSI());
+}
+
+void readCells()
+{
+  cell1Voltage = (analogRead(CELL1) / 4095.0) * 4.2;
+  cell2Voltage = (analogRead(CELL2) / 4095.0) * 4.2;
+  cell3Voltage = (analogRead(CELL3) / 4095.0) * 4.2;
+  cell4Voltage = (analogRead(CELL4) / 4095.0) * 4.2;
+}
+
+void calculateBattery()
+{
+  packVoltage =
+    cell1Voltage +
+    cell2Voltage +
+    cell3Voltage +
+    cell4Voltage;
+
+  averageVoltage = packVoltage / 4.0;
+
+  highestVoltage = cell1Voltage;
+  strongestCell = "CELL1";
+
+  if (cell2Voltage > highestVoltage)
+  {
+    highestVoltage = cell2Voltage;
+    strongestCell = "CELL2";
+  }
+
+  if (cell3Voltage > highestVoltage)
+  {
+    highestVoltage = cell3Voltage;
+    strongestCell = "CELL3";
+  }
+
+  if (cell4Voltage > highestVoltage)
+  {
+    highestVoltage = cell4Voltage;
+    strongestCell = "CELL4";
+  }
+
+  lowestVoltage = cell1Voltage;
+  weakestCell = "CELL1";
+
+  if (cell2Voltage < lowestVoltage)
+  {
+    lowestVoltage = cell2Voltage;
+    weakestCell = "CELL2";
+  }
+
+  if (cell3Voltage < lowestVoltage)
+  {
+    lowestVoltage = cell3Voltage;
+    weakestCell = "CELL3";
+  }
+
+  if (cell4Voltage < lowestVoltage)
+  {
+    lowestVoltage = cell4Voltage;
+    weakestCell = "CELL4";
+  }
+
+  if (averageVoltage > 0)
+  {
+    imbalance =
+      ((highestVoltage - lowestVoltage) /
+       averageVoltage) * 100.0;
+  }
+  else
+  {
+    imbalance = 0;
+  }
+
+  if (imbalance < 5)
+  {
+    batteryStatus = "HEALTHY";
+  }
+  else if (imbalance < 15)
+  {
+    batteryStatus = "MINOR IMBALANCE";
+  }
+  else if (imbalance < 30)
+  {
+    batteryStatus = "CRITICAL";
+  }
+  else
+  {
+    batteryStatus = "PACK FAILURE";
+  }
+}
+
+void detectSensorFaults()
+{
+  activeFault = NO_FAULT;
+
+  if (cell1Voltage < 0.1)
+  {
+    activeFault = CELL1_DISCONNECTED;
+    return;
+  }
+
+  if (cell1Voltage > 4.3)
+  {
+    activeFault = INVALID_READING;
+    return;
+  }
+
+  if (cell2Voltage < 0.1)
+  {
+    activeFault = CELL2_DISCONNECTED;
+    return;
+  }
+
+  if (cell2Voltage > 4.3)
+  {
+    activeFault = INVALID_READING;
+    return;
+  }
+
+  if (cell3Voltage < 0.1)
+  {
+    activeFault = CELL3_DISCONNECTED;
+    return;
+  }
+
+  if (cell3Voltage > 4.3)
+  {
+    activeFault = INVALID_READING;
+    return;
+  }
+
+  if (cell4Voltage < 0.1)
+  {
+    activeFault = CELL4_DISCONNECTED;
+    return;
+  }
+
+  if (cell4Voltage > 4.3)
+  {
+    activeFault = INVALID_READING;
+    return;
+  }
+}
+
+void detectBatteryFaults()
+{
+  if (activeFault != NO_FAULT)
+  {
+    return;
+  }
+
+  if (lowestVoltage < 3.0)
+  {
+    activeFault = WEAK_CELL;
+    return;
+  }
+
+  if (highestVoltage > 4.1)
+  {
+    activeFault = OVER_VOLTAGE;
+    return;
+  }
+}
+
+void detectFrozenADC()
+{
+  if (simulateFrozenADC)
+  {
+    activeFault = ADC_FROZEN;
+  }
+}
+
+void detectRelayMismatch()
+{
+#if RELAY_FEEDBACK_ENABLED
+
+  int feedback = digitalRead(RELAY_FEEDBACK);
+
+  if (systemMode == NORMAL ||
+      systemMode == DEGRADED)
+  {
+    if (feedback != HIGH)
+    {
+      activeFault = RELAY_MISMATCH;
+    }
+  }
+
+  if (systemMode == FAILSAFE ||
+      systemMode == SHUTDOWN)
+  {
+    if (feedback != LOW)
+    {
+      activeFault = RELAY_MISMATCH;
+    }
+  }
+
+#endif
+}
+
+void manageSystemMode()
+{
+  if (activeFault == NO_FAULT)
+  {
+    if (systemMode != NORMAL)
+    {
+      if (recoveryStart == 0)
+      {
+        recoveryStart = millis();
+      }
+
+      if (millis() - recoveryStart >= recoveryTime)
+      {
+        systemMode = NORMAL;
+
+        recoveryStart = 0;
+        failsafeStart = 0;
+
+        Serial.println();
+        Serial.println("RECOVERY COMPLETE");
+        Serial.println("SYSTEM MODE : NORMAL");
+      }
+    }
+
+    return;
+  }
+
+  recoveryStart = 0;
+
+  if (activeFault == CELL1_DISCONNECTED ||
+      activeFault == CELL2_DISCONNECTED ||
+      activeFault == CELL3_DISCONNECTED ||
+      activeFault == CELL4_DISCONNECTED)
+  {
+    if (systemMode != DEGRADED)
+    {
+      systemMode = DEGRADED;
+      logFault(activeFault);
+    }
+
+    return;
+  }
+
+  if (activeFault == WEAK_CELL)
+  {
+    if (systemMode != DEGRADED)
+    {
+      systemMode = DEGRADED;
+      logFault(activeFault);
+    }
+
+    return;
+  }
+
+  if (activeFault == INVALID_READING ||
+      activeFault == OVER_VOLTAGE ||
+      activeFault == ADC_FROZEN ||
+      activeFault == RELAY_MISMATCH)
+  {
+    if (systemMode != FAILSAFE &&
+        systemMode != SHUTDOWN)
+    {
+      systemMode = FAILSAFE;
+      failsafeStart = millis();
+
+      logFault(activeFault);
+
+      Serial.println();
+      Serial.println("SYSTEM MODE : FAILSAFE");
+      Serial.println("Shutdown timer started");
+    }
+
+    if (systemMode == FAILSAFE)
+    {
+      if (millis() - failsafeStart >= shutdownTime)
+      {
+        systemMode = SHUTDOWN;
+
+        Serial.println();
+        Serial.println("================================");
+        Serial.println("FAILSAFE TIMEOUT");
+        Serial.println("SYSTEM MODE : SHUTDOWN");
+        Serial.println("OUTPUT DISABLED");
+        Serial.println("================================");
+      }
+    }
+
+    return;
+  }
+}
+
+void controlOutputs()
+{
+  if (systemMode == NORMAL)
+  {
+    digitalWrite(RELAY, HIGH);
+    digitalWrite(BUZZER, LOW);
+  }
+  else if (systemMode == DEGRADED)
+  {
+    digitalWrite(RELAY, HIGH);
+    digitalWrite(BUZZER, HIGH);
+  }
+  else if (systemMode == FAILSAFE)
+  {
+    digitalWrite(RELAY, LOW);
+    digitalWrite(BUZZER, HIGH);
+  }
+  else if (systemMode == SHUTDOWN)
+  {
+    digitalWrite(RELAY, LOW);
+    digitalWrite(BUZZER, LOW);
+  }
+}
+
+void updateLCD()
+{
+  lcd.clear();
+
+  if (systemMode == FAILSAFE)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print("FAILSAFE");
+
+    lcd.setCursor(0, 1);
+
+    if (activeFault == ADC_FROZEN)
+    {
+      lcd.print("ADC FROZEN");
+    }
+    else if (activeFault == OVER_VOLTAGE)
+    {
+      lcd.print("OVER VOLTAGE");
+    }
+    else if (activeFault == INVALID_READING)
+    {
+      lcd.print("INVALID DATA");
+    }
+    else if (activeFault == RELAY_MISMATCH)
+    {
+      lcd.print("RELAY ERROR");
+    }
+    else
+    {
+      lcd.print("OUTPUT OFF");
+    }
+
+    return;
+  }
+
+  if (systemMode == SHUTDOWN)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print("SYSTEM");
+
+    lcd.setCursor(0, 1);
+    lcd.print("SHUTDOWN");
+
+    return;
+  }
+
+  if (systemMode == DEGRADED)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print("DEGRADED");
+
+    lcd.setCursor(0, 1);
+
+    if (activeFault == CELL1_DISCONNECTED)
+    {
+      lcd.print("CELL1 FAULT");
+    }
+    else if (activeFault == CELL2_DISCONNECTED)
+    {
+      lcd.print("CELL2 FAULT");
+    }
+    else if (activeFault == CELL3_DISCONNECTED)
+    {
+      lcd.print("CELL3 FAULT");
+    }
+    else if (activeFault == CELL4_DISCONNECTED)
+    {
+      lcd.print("CELL4 FAULT");
+    }
+    else if (activeFault == WEAK_CELL)
+    {
+      lcd.print("WEAK CELL");
+    }
+    else
+    {
+      lcd.print("FAULT");
+    }
+
+    return;
+  }
+
+  if (currentScreen == 0)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print("PACK:");
+    lcd.print(packVoltage, 1);
+    lcd.print("V");
+
+    lcd.setCursor(0, 1);
+    lcd.print("NORMAL");
+  }
+  else if (currentScreen == 1)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print("C1:");
+    lcd.print(cell1Voltage, 1);
+    lcd.print(" C2:");
+    lcd.print(cell2Voltage, 1);
+
+    lcd.setCursor(0, 1);
+    lcd.print("C3:");
+    lcd.print(cell3Voltage, 1);
+    lcd.print(" C4:");
+    lcd.print(cell4Voltage, 1);
+  }
+  else if (currentScreen == 2)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print("AVG:");
+    lcd.print(averageVoltage, 2);
+
+    lcd.setCursor(0, 1);
+    lcd.print("IMB:");
+    lcd.print(imbalance, 1);
+    lcd.print("%");
+  }
+  else if (currentScreen == 3)
+  {
+    lcd.setCursor(0, 0);
+    lcd.print("BATTERY:");
+
+    lcd.setCursor(0, 1);
+    lcd.print(batteryStatus);
+  }
+}
+
+void serialOutput()
+{
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("BATTERY MONITOR");
+  Serial.println("================================");
+
+  Serial.print("Cell1 : ");
+  Serial.print(cell1Voltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Cell2 : ");
+  Serial.print(cell2Voltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Cell3 : ");
+  Serial.print(cell3Voltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Cell4 : ");
+  Serial.print(cell4Voltage, 2);
+  Serial.println(" V");
+
+  Serial.println();
+
+  Serial.print("Pack Voltage : ");
+  Serial.print(packVoltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Average : ");
+  Serial.print(averageVoltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Imbalance : ");
+  Serial.print(imbalance, 2);
+  Serial.println(" %");
+
+  Serial.println();
+
+  Serial.print("Strongest : ");
+  Serial.print(strongestCell);
+  Serial.print(" ");
+  Serial.print(highestVoltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Weakest : ");
+  Serial.print(weakestCell);
+  Serial.print(" ");
+  Serial.print(lowestVoltage, 2);
+  Serial.println(" V");
+
+  Serial.println();
+
+  Serial.print("MODE : ");
+  printModeName(systemMode);
+
+  Serial.print("FAULT : ");
+  printFaultName(activeFault);
+
+  Serial.print("WiFi RSSI : ");
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+  }
+  else
+  {
+    Serial.println("NOT CONNECTED");
+  }
+
+  Serial.print("Blynk : ");
+
+  if (Blynk.connected())
+  {
+    Serial.println("CONNECTED");
+  }
+  else
+  {
+    Serial.println("DISCONNECTED");
+  }
+
+  Serial.print("TIME : ");
+  Serial.print(millis());
+  Serial.println(" ms");
+
+  Serial.println("================================");
+}
+
+void checkSerialCommand()
+{
+  if (Serial.available() > 0)
+  {
+    char command = Serial.read();
+
+    if (command == 'F' || command == 'f')
+    {
+      simulateFrozenADC = true;
+
+      Serial.println();
+      Serial.println("ADC FROZEN TEST ENABLED");
+      Serial.println();
+    }
+
+    if (command == 'R' || command == 'r')
+    {
+      simulateFrozenADC = false;
+
+      activeFault = NO_FAULT;
+      recoveryStart = millis();
+
+      if (systemMode == FAILSAFE ||
+          systemMode == SHUTDOWN)
+      {
+        systemMode = FAILSAFE;
+        failsafeStart = 0;
+      }
+
+      Serial.println();
+      Serial.println("FAULT CLEARED");
+      Serial.println("RECOVERY STARTED");
+      Serial.println();
+    }
+  }
+}
+
+void logFault(FaultType fault)
+{
+  if (logIndex < MAX_LOGS)
+  {
+    faultLogs[logIndex].timestamp = millis();
+    faultLogs[logIndex].fault = fault;
+    faultLogs[logIndex].mode = systemMode;
+
+    logIndex++;
+  }
+
+  Serial.println();
+  Serial.println("******** FAULT LOG ********");
+
+  Serial.print("Timestamp : ");
+  Serial.print(millis());
+  Serial.println(" ms");
+
+  Serial.print("Fault : ");
+  printFaultName(fault);
+
+  Serial.print("Mode : ");
+  printModeName(systemMode);
+
+  Serial.println("****************************");
+}
+
+void printFaultName(FaultType fault)
+{
+  switch (fault)
+  {
+    case NO_FAULT:
+      Serial.println("NO FAULT");
+      break;
+
+    case CELL1_DISCONNECTED:
+      Serial.println("CELL1 SENSOR DISCONNECTED");
+      break;
+
+    case CELL2_DISCONNECTED:
+      Serial.println("CELL2 SENSOR DISCONNECTED");
+      break;
+
+    case CELL3_DISCONNECTED:
+      Serial.println("CELL3 SENSOR DISCONNECTED");
+      break;
+
+    case CELL4_DISCONNECTED:
+      Serial.println("CELL4 SENSOR DISCONNECTED");
+      break;
+
+    case INVALID_READING:
+      Serial.println("INVALID READING");
+      break;
+
+    case WEAK_CELL:
+      Serial.println("WEAK CELL");
+      break;
+
+    case OVER_VOLTAGE:
+      Serial.println("OVER VOLTAGE");
+      break;
+
+    case ADC_FROZEN:
+      Serial.println("ADC FROZEN");
+      break;
+
+    case RELAY_MISMATCH:
+      Serial.println("RELAY MISMATCH");
+      break;
+  }
+}
+
+void printModeName(SystemMode mode)
+{
+  switch (mode)
+  {
+    case NORMAL:
+      Serial.println("NORMAL");
+      break;
+
+    case DEGRADED:
+      Serial.println("DEGRADED");
+      break;
+
+    case FAILSAFE:
+      Serial.println("FAILSAFE");
+      break;
+
+    case SHUTDOWN:
+      Serial.println("SHUTDOWN");
+      break;
+  }
+}
