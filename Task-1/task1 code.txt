@@ -1,0 +1,155 @@
+#define CELL1 34
+#define CELL2 35
+#define CELL3 32
+#define CELL4 33
+float v1, v2, v3, v4;
+float packVoltage;
+float averageVoltage;
+float maxVoltage;
+float minVoltage;
+float imbalance;
+String strongestCell;
+String weakestCell;
+String batteryStatus;
+int statusCode;
+void setup()
+{
+  Serial.begin(115200);
+  Serial.println("====================================");
+  Serial.println("SMART BATTERY INTELLIGENCE ENGINE");
+  Serial.println("====================================");
+}
+void loop()
+{
+  // Read Cell Voltages
+
+  v1 = (analogRead(CELL1) / 4095.0) * 4.2;
+  v2 = (analogRead(CELL2) / 4095.0) * 4.2;
+  v3 = (analogRead(CELL3) / 4095.0) * 4.2;
+  v4 = (analogRead(CELL4) / 4095.0) * 4.2;
+
+  // Calculate Pack Voltage
+
+  packVoltage = v1 + v2 + v3 + v4;
+
+  // Calculate Average Voltage
+
+  averageVoltage = packVoltage / 4.0;
+
+  // Find Strongest Cell
+
+  maxVoltage = v1;
+  strongestCell = "CELL1";
+
+  if(v2 > maxVoltage)
+  {
+    maxVoltage = v2;
+    strongestCell = "CELL2";
+  }
+
+  if(v3 > maxVoltage)
+  {
+    maxVoltage = v3;
+    strongestCell = "CELL3";
+  }
+
+  if(v4 > maxVoltage)
+  {
+    maxVoltage = v4;
+    strongestCell = "CELL4";
+  }
+
+  // Find Weakest Cell
+
+  minVoltage = v1;
+  weakestCell = "CELL1";
+
+  if(v2 < minVoltage)
+  {
+    minVoltage = v2;
+    weakestCell = "CELL2";
+  }
+
+  if(v3 < minVoltage)
+  {
+    minVoltage = v3;
+    weakestCell = "CELL3";
+  }
+
+  if(v4 < minVoltage)
+  {
+    minVoltage = v4;
+    weakestCell = "CELL4";
+  }
+
+  // Calculate Imbalance %
+
+  imbalance =
+  ((maxVoltage - minVoltage) /
+  averageVoltage) * 100.0;
+
+  // Battery Health Classification
+
+  if(imbalance < 5)
+  {
+    batteryStatus = "HEALTHY";
+    statusCode = 0;
+  }
+  else if(imbalance < 15)
+  {
+    batteryStatus = "MINOR IMBALANCE";
+    statusCode = 1;
+  }
+  else if(imbalance < 30)
+  {
+    batteryStatus = "CRITICAL IMBALANCE";
+    statusCode = 2;
+  }
+  else
+  {
+    batteryStatus = "PACK FAILURE";
+    statusCode = 3;
+  }
+  // Display Results
+  Serial.println();
+  Serial.println("====================================");
+  Serial.print("Cell1 Voltage : ");
+  Serial.print(v1, 2);
+  Serial.println(" V");
+  Serial.print("Cell2 Voltage : ");
+  Serial.print(v2, 2);
+  Serial.println(" V");
+  Serial.print("Cell3 Voltage : ");
+  Serial.print(v3, 2);
+  Serial.println(" V");
+  Serial.print("Cell4 Voltage : ");
+  Serial.print(v4, 2);
+  Serial.println(" V");
+  Serial.println();
+  Serial.print("Pack Voltage : ");
+  Serial.print(packVoltage, 2);
+  Serial.println(" V");
+  Serial.print("Average Voltage : ");
+  Serial.print(averageVoltage, 2);
+  Serial.println(" V");
+  Serial.println();
+  Serial.print("Strongest Cell : ");
+  Serial.print(strongestCell);
+  Serial.print(" (");
+  Serial.print(maxVoltage, 2);
+  Serial.println(" V)");
+  Serial.print("Weakest Cell : ");
+  Serial.print(weakestCell);
+  Serial.print(" (");
+  Serial.print(minVoltage, 2);
+  Serial.println(" V)");
+  Serial.println();
+  Serial.print("Imbalance : ");
+  Serial.print(imbalance, 2);
+  Serial.println(" %");
+  Serial.print("Battery Status : ");
+  Serial.println(batteryStatus);
+  Serial.print("Status Code : ");
+  Serial.println(statusCode);
+  Serial.println("====================================");
+  delay(2000);
